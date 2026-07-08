@@ -267,6 +267,33 @@ passes (5/5), which covers both sides of the boundary: new user → 1, consecuti
 same day → no change, skipped day → reset to 1, and now Saturday→Sunday → +1. The change is
 confined to one boolean condition and touches no other feature.
 
+### Issue #5 — "The last song in a playlist never shows up"
+
+**Affected file:** `services/playlist_service.py`
+
+**1. How I reproduced it:** Ran `tests/test_playlists.py`. `test_playlist_returns_all_songs`
+adds 5 songs and expects 5 back; `test_playlist_returns_songs_in_order` expects
+`Track 1 … Track 5`. Both failed, returning only 4 songs (missing `Track 5`). Any non-empty
+playlist triggers it.
+
+**2. How I found the root cause:** Traced `GET /playlists/<id>/songs` →
+`routes/playlists.py::get_songs()` → `playlist_service.get_playlist_songs()`. The query
+itself was correct — it joins `playlist_entries`, filters by playlist, and orders by
+`position` ascending. The problem was on the very last line: the return statement sliced the
+result with `songs[:-1]`. Seeing the `[:-1]` slice made it obvious — it discards the last
+element of an already-correct, position-ordered list.
+
+**3. The root cause:** `get_playlist_songs()` built the correct ordered list of songs but
+then returned `songs[:-1]` instead of `songs`. The `[:-1]` slice drops the final element, so
+the song with the highest `position` (the last one added) was always omitted. It was a
+straightforward off-by-one at the boundary of the list, not a query or ordering problem.
+
+**4. The fix and side-effect check:** Changed the return to
+`[song.to_dict() for song in songs]` (removed the `[:-1]`). All 3 playlist tests pass,
+including `test_empty_playlist_returns_empty_list` — the important boundary check, since an
+empty playlist must still return `[]` (it does). Ordering is unaffected because the `ORDER
+BY position` in the query was never the problem.
+
 ---
 
 ### Setup confirmation
