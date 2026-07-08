@@ -294,6 +294,47 @@ including `test_empty_playlist_returns_empty_list` — the important boundary ch
 empty playlist must still return `[]` (it does). Ordering is unaffected because the `ORDER
 BY position` in the query was never the problem.
 
+### Issue #4 — "I got notified when a friend added my song to a playlist but not when they rated it"
+
+**Affected file:** `services/notification_service.py`
+
+**1. How I reproduced it:** Against the live app (Flask test client) with seed data: Nova
+shared "Midnight Drive"; her friend Darius rated it. `GET /users/<nova>/notifications`
+before = 1, `POST /songs/<song>/rate` with Darius + score 5 returned `201`, and after the
+notification count was **still 1** — the rating saved but Nova got nothing.
+
+**2. How I found the root cause:** Traced `POST /songs/<id>/rate` →
+`routes/songs.py::rate()` → `notification_service.rate_song()`. Notably `rate_song` already
+lives in `notification_service.py` alongside `add_to_playlist`. Reading both side by side,
+`add_to_playlist()` ends with a `create_notification(...)` call guarded by
+`if song.shared_by != added_by_user_id:`, while `rate_song()` commits the rating and returns
+— it never calls `create_notification` at all. That contrast (same file, same "notify the
+sharer" responsibility, one path does it and the other doesn't) is what made me certain this
+was the exact cause rather than, say, a filtering issue in `get_notifications`.
+
+**3. The root cause:** Notifications to a song's original sharer are created explicitly by
+each interaction handler. The playlist-add handler does this; the rating handler simply
+omitted the step. So rating a song had no side effect beyond saving the score — there was no
+missing model or broken query, just an absent `create_notification` call in `rate_song()`.
+
+**4. The fix and side-effect check:** After the rating commits, added a `create_notification`
+call mirroring the playlist-add pattern — notifying `song.shared_by` with type
+`song_rated`, but only `if song.shared_by != user_id` so users aren't notified for rating
+their own songs. Verified against the live app:
+- Friend rates Nova's song → notification count 1 → 2, body
+  `"darius rated your song 'Midnight Drive' 5 out of 5."` ✅
+- Nova rates her **own** song → count unchanged (no self-notification) ✅
+- Full test suite still green (13/13).
+
+> **Separate bug found (not one of my three, left as-is):** while side-effect-checking the
+> add-to-playlist notification path, I hit a pre-existing `IntegrityError: NOT NULL
+> constraint failed: playlist_entries.position`. `add_to_playlist()` adds the song via the
+> ORM relationship (`playlist.songs.append(song)`), which cannot populate the non-null
+> `position`/`added_by` columns on the `playlist_entries` association table. This is
+> independent of my change — `git log` shows I never modified `add_to_playlist`, and it
+> fails on the original code too. Noting it here for completeness; it is outside the three
+> issues I chose to fix.
+
 ---
 
 ### Setup confirmation
