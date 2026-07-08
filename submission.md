@@ -1,5 +1,69 @@
 # Mixtape — Submission
 
+**Branch:** `bugfix/mixtape` ·
+**Submission URL:** https://github.com/aryamankachroo/MixTape/tree/bugfix/mixtape
+
+**Bugs fixed (3):** #1 listening streak resets, #5 last playlist song missing,
+#4 no notification when a friend rates your song.
+
+**Commit history (`git log --oneline`, one `fix:` commit per bug):**
+
+```
+ae23d90 fix: notify song sharer when a friend rates their song
+cd01d90 fix: return all playlist songs instead of dropping the last one
+b729af9 fix: increment listening streak on Sundays instead of resetting
+d37467e mil 1
+```
+
+---
+
+## AI Usage
+
+I used an AI coding assistant (Cursor) throughout this project. Because the assignment is a
+bug hunt rather than greenfield coding, I leaned on it mostly for **codebase navigation and
+debugging**, not code generation — the actual fixes were 1–8 lines each and the real work
+was understanding *why* they were broken.
+
+**Where AI genuinely helped:**
+
+- **Orientation / navigation.** I had it summarize each `services/` file's responsibility
+  and trace the call chains end to end (e.g. `POST /songs/<id>/rate` → `routes/songs.py`
+  → `notification_service.rate_song()`). This is what let me write the Milestone 1 codebase
+  map with real data flows instead of just a file listing.
+- **Explaining code I'd already found.** For the streak bug I asked it to confirm the
+  semantics of `datetime.weekday()` (Mon=0 … Sun=6) once I'd narrowed the problem to the
+  `today.weekday() != 6` clause. Knowing Sunday == 6 is what turned "this looks suspicious"
+  into "this is definitely the cause."
+- **Reproduction tooling.** It helped me drive the live app through Flask's test client to
+  reproduce Issue #4 (rate a song, check the sharer's notification count before/after)
+  rather than firing manual HTTP requests.
+
+**Where I had to verify things myself / where the AI was wrong or incomplete:**
+
+- **The AI's first diagnosis of the search bug (#3) was wrong.** Reading the code, the
+  `outerjoin(song_tags)` fan-out *looks* like it should return a song once per tag, and that
+  was the initial hypothesis. But when I actually ran `tests/test_search.py` and hit
+  `GET /songs/search?q=heights`, there were **no duplicates** — SQLAlchemy 2.0 auto-dedupes
+  identical entities in a single-entity query, so the bug doesn't manifest in this
+  environment. This is exactly the "plausible but wrong" trap: I only caught it by running
+  the code. I dropped #3 and picked #4 instead.
+- **A bug the AI didn't predict surfaced only by running things.** While side-effect-checking
+  Issue #4, the add-to-playlist path threw a pre-existing `IntegrityError` (the `position`
+  column on `playlist_entries` is never populated by the ORM `append`). Reasoning about the
+  code hadn't flagged it; executing it did. I confirmed via `git log` that it wasn't caused
+  by my change and left it out of scope.
+- **Every fix was verified by running tests, not by trusting the explanation.** For each bug
+  I ran the relevant test file (and the full 13-test suite at the end) and checked both sides
+  of the boundary conditions (#1: Saturday→Sunday *and* skipped-day reset; #5: full playlist
+  *and* empty playlist).
+
+Overall the workflow that worked was: **I locate the suspicious code → AI helps me
+understand it → I verify the diagnosis by actually running the code.** Asking the AI to find
+a bug before I'd read the relevant code consistently pointed somewhere plausible but not
+always correct (the #3 case being the clearest example).
+
+---
+
 ## Milestone 1: Codebase Map
 
 Mixtape is a social music app (Flask + SQLAlchemy + SQLite) where users share songs,
