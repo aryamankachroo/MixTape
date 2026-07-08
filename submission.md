@@ -159,6 +159,116 @@ cause is easiest to pin down from the data flow above.
 
 ---
 
+## Milestone 2: Reproducing the Bugs (before any fix)
+
+**Chosen bugs: #1 (streak resets), #4 (no notification on rate), #5 (last playlist song missing).**
+
+I originally intended to take Issue #3 (search duplicates) but could not reproduce it in
+this environment (see the note at the bottom of this section), so I swapped it for Issue #4.
+
+No code has been changed yet — everything below is reproduction only. Two of the three
+bugs have pre-written tests that encode the *correct* behavior, so a failing test is a
+clean, repeatable reproduction. The third (#4) I reproduced against the live app.
+
+Baseline: `python seed_data.py` then `python -m pytest tests/ -v` →
+**3 failed, 10 passed**, matching the three chosen bugs.
+
+### Issue #1 — "My listening streak keeps resetting" (`streak_service.py`)
+
+- **How I reproduced it:** Run the pre-written test
+  `tests/test_streaks.py::test_streak_increments_on_sunday`. It listens on a Saturday
+  (`2024-06-15`, `weekday()==5`) and then the next day, Sunday (`2024-06-16`,
+  `weekday()==6`).
+- **Data condition that triggers it:** the *second* consecutive listen lands on a **Sunday**.
+  Any consecutive-day pair where the second day is a Sunday hits the bad branch.
+- **Expected:** streak goes 1 → 2 (two consecutive days).
+- **Actual:** streak stays at **1** (`assert 1 == 2` fails). On Sundays the streak resets
+  instead of incrementing. This is a specific-condition bug: it only shows up one day of
+  the week, which is why users report it as intermittent.
+
+### Issue #5 — "The last song in a playlist never shows up" (`playlist_service.py`)
+
+- **How I reproduced it:** Run `tests/test_playlists.py`. `test_playlist_returns_all_songs`
+  builds a playlist of 5 songs and asks for them back;
+  `test_playlist_returns_songs_in_order` checks the returned titles.
+- **Data condition that triggers it:** any non-empty playlist (the more songs, the more
+  obvious). With the seed data, `GET /playlists/<id>/songs` returns one fewer song than
+  were added.
+- **Expected:** all 5 songs, ordered `Track 1 … Track 5`.
+- **Actual:** only **4** songs returned (`Right contains one more item: 'Track 5'`); the
+  final song by `position` is always dropped. Off-by-one at the end of the ordered list.
+
+### Issue #4 — "Notified when a friend adds my song to a playlist, but not when they rate it" (`notification_service.py`)
+
+- **How I reproduced it (live app, via Flask test client):**
+  1. Seed the DB. Nova shared the song "Midnight Drive"; Darius is her friend.
+  2. Check Nova's notifications: `GET /users/<nova_id>/notifications` → **count = 1**
+     (the pre-seeded playlist-add notification).
+  3. Darius rates Nova's song: `POST /songs/<song_id>/rate`
+     with `{"user_id": <darius_id>, "score": 5}` → `201 Created`.
+  4. Re-check Nova's notifications → **count is still 1**.
+- **Expected:** the rating succeeds *and* Nova receives a new "song rated" notification
+  (count → 2), mirroring how add-to-playlist already notifies the sharer.
+- **Actual:** the rating is saved, but **no notification is created** — the count does not
+  change. `rate_song()` never calls `create_notification()`, whereas `add_to_playlist()`
+  in the same file does. This is a missing-side-effect bug, not a crash.
+
+### Issue I attempted but could NOT reproduce — #3 "Same song shows up twice in search"
+
+- **Attempt:** the search suite `tests/test_search.py` (which asserts multi-tag songs
+  appear exactly once) **all passes**, and hitting the live endpoint
+  `GET /songs/search?q=heights` for "Crown Heights Anthem" (3 tags) returns
+  `{"count": 1, ...}` — a single result, no duplicates.
+- **Why:** the code does `db.session.query(Song).outerjoin(song_tags)...` which fans out to
+  one row per tag, but on SQLAlchemy 2.0 the ORM auto-deduplicates identical entities in a
+  single-entity query result, so the duplicates never surface here. The latent bug exists in
+  the query shape, but it does not manifest in this environment.
+- **Decision:** per the milestone's guidance ("if you can't reproduce a bug after a genuine
+  attempt, try a different one"), I dropped #3 and chose #4 instead.
+
+**Checkpoint status:** I can deliberately trigger all three chosen bugs (#1 and #5 via
+failing tests, #4 via the API), I know the exact inputs/conditions for each, and no code
+has been changed yet.
+
+---
+
+## Milestone 3: Root Cause Analysis and Fixes
+
+Each bug below was traced from symptom to root cause, fixed with the smallest possible
+change, verified (including both sides of any boundary), and committed on its own.
+
+### Issue #1 — "My listening streak keeps resetting"
+
+**Affected file:** `services/streak_service.py`
+
+**1. How I reproduced it:** Ran `tests/test_streaks.py::test_streak_increments_on_sunday`,
+which listens on Saturday `2024-06-15` then Sunday `2024-06-16` and asserts the streak goes
+1 → 2. The trigger condition is a consecutive-day listen where the *second* day is a Sunday.
+
+**2. How I found the root cause:** Started from `routes/songs.py::listen()` →
+`streak_service.record_listening_event()` → `update_listening_streak()`. Reading that
+function top-down, the "listened yesterday" branch was
+`elif days_since_last == 1 and today.weekday() != 6:`. The moment I saw the extra
+`today.weekday() != 6` clause I was confident: `datetime.weekday()` returns 6 for Sunday, so
+this clause makes the consecutive-day case *false* on Sundays, dropping execution into the
+`else` branch that resets the streak. Nothing else in the function touches the streak value,
+so this single comparison is the cause.
+
+**3. The root cause:** For a genuine consecutive-day listen, the streak should always
+increment. But the increment branch had an extra guard, `today.weekday() != 6`, that
+excluded Sundays (`weekday()` numbers days Mon=0 … Sun=6). Whenever a user's second
+consecutive day landed on a Sunday, the `days_since_last == 1` branch was skipped and the
+`else` branch ran instead, resetting the streak to 1. There is no calendar reason a streak
+should break on Sundays — the weekday check was simply wrong logic.
+
+**4. The fix and side-effect check:** Removed the `and today.weekday() != 6` clause so the
+branch is just `elif days_since_last == 1:`. Verified the whole `test_streaks.py` suite
+passes (5/5), which covers both sides of the boundary: new user → 1, consecutive day → +1,
+same day → no change, skipped day → reset to 1, and now Saturday→Sunday → +1. The change is
+confined to one boolean condition and touches no other feature.
+
+---
+
 ### Setup confirmation
 
 - Virtual environment created, `requirements.txt` installed.
